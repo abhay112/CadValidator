@@ -1,6 +1,6 @@
 import initOpenCascade from "opencascade.js/dist/opencascade.wasm.js";
 import wasmUrl from "opencascade.js/dist/opencascade.wasm.wasm?url";
-import type { FromWorker, ToWorker } from "../lib/types";
+import type { FromWorker, KidEntry, ToWorker } from "../lib/types";
 import { Engine } from "./engine";
 
 const post = (msg: FromWorker, transfer: Transferable[] = []) => (self as unknown as Worker).postMessage(msg, transfer);
@@ -9,6 +9,7 @@ const post = (msg: FromWorker, transfer: Transferable[] = []) => (self as unknow
 const WASM_BYTES = 65_864_037;
 
 let engine: Engine | null = null;
+let kidWaiter: ((entries: KidEntry[] | null) => void) | null = null;
 let booting: Promise<void> | null = null;
 
 /** Stream the WASM binary ourselves so the UI can show download progress. */
@@ -68,8 +69,23 @@ self.onmessage = async (ev: MessageEvent<ToWorker>) => {
     return;
   }
   try {
-    if (msg.type === "validate") {
+    if (msg.type === "kids") {
+      const waiting = kidWaiter;
+      kidWaiter = null;
+      waiting?.(msg.entries);
+    } else if (msg.type === "prep") {
+      post({ type: "prepared", id: msg.id, count: engine.prepare(new Uint8Array(msg.buffer), msg.kind) });
+    } else if (msg.type === "job") {
+      post({ type: "entry", id: msg.id, entry: engine.runJob(msg.index) });
+    } else if (msg.type === "validate") {
       engine.onStage = (text) => post({ type: "stage", id: msg.id, text });
+      engine.requestKids = (count, kind, source) =>
+        new Promise((resolve) => {
+          kidWaiter = resolve;
+          // The page hands this copy to helper workers; the original stays here for the whole-model passes.
+          const buffer = source.slice().buffer as ArrayBuffer;
+          post({ type: "needKids", id: msg.id, count, kind, buffer }, [buffer]);
+        });
       post({ type: "result", id: msg.id, report: await engine.validate(msg.name, msg.buffer) });
     } else if (msg.type === "sample") {
       const s = engine.sample(msg.kind);

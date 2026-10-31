@@ -103,8 +103,20 @@ export interface Report {
   preview: Float32Array | null;
 }
 
+/** One part's outcome from a parallel run: `kid` is null when an identical part was already checked on that worker. */
+export interface KidEntry {
+  index: number;
+  key: string;
+  kid: ChildReport | null;
+}
+
+export type KidKind = "step" | "fcstd";
+
 export type ToWorker =
   | { type: "init" }
+  | { type: "prep"; id: number; buffer: ArrayBuffer; kind: KidKind }
+  | { type: "job"; id: number; index: number }
+  | { type: "kids"; id: number; entries: KidEntry[] | null }
   | { type: "validate"; id: number; name: string; buffer: ArrayBuffer }
   | { type: "sample"; id: number; kind: SampleKind };
 
@@ -113,6 +125,9 @@ export type FromWorker =
   | { type: "ready" }
   | { type: "initError"; message: string }
   | { type: "stage"; id: number; text: string }
+  | { type: "needKids"; id: number; count: number; kind: KidKind; buffer: ArrayBuffer }
+  | { type: "prepared"; id: number; count: number }
+  | { type: "entry"; id: number; entry: KidEntry }
   | { type: "result"; id: number; report: Report }
   | { type: "sample"; id: number; name: string; buffer: ArrayBuffer }
   | { type: "error"; id: number; message: string };

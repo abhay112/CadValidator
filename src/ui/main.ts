@@ -1,5 +1,5 @@
 import "./style.css";
-import type { FromWorker, SampleKind, ToWorker } from "../lib/types";
+import type { FromWorker, KidEntry, KidKind, SampleKind, ToWorker } from "../lib/types";
 import { UniquenessRegistry } from "../lib/uniqueness";
 import { bytesLabel, esc } from "./format";
 import { cardHtml, type Item } from "./render";
@@ -60,6 +60,67 @@ function setEngine(html: string, cls = "") {
 }
 let startedAt = 0;
 
+/** Helper workers for the parts of one assembly; each loads its own copy of the engine, so keep the count modest. */
+const HELPERS = Math.max(1, Math.min(3, (navigator.hardwareConcurrency || 4) - 2));
+
+function showStage(id: number, text: string) {
+  const it = items.find((i) => i.id === id);
+  if (!it) return;
+  it.stage = text;
+  // Update the badge in place; a full re-render would be wasteful while the workers are busy.
+  const badge = document.querySelector(`[data-id="${it.id}"]`)?.closest(".card")?.querySelector(".badge.wait");
+  if (badge) badge.textContent = text;
+}
+
+/**
+ * Check an assembly's parts on short-lived helper workers that pull one part at a time (so big and small parts balance
+ * out), then hand the outcomes to the main worker, which is busy with the whole-model passes. Any failure answers
+ * null and the main worker simply checks the parts itself.
+ */
+function runKids(id: number, count: number, source: ArrayBuffer, kind: KidKind) {
+  const entries: KidEntry[] = [];
+  const helpers: Worker[] = [];
+  let next = 0;
+  let finished = false;
+  const finish = (ok: boolean) => {
+    if (finished) return;
+    finished = true;
+    for (const h of helpers) h.terminate();
+    send({ type: "kids", id, entries: ok ? entries : null });
+  };
+  const assign = (h: Worker) => {
+    if (next < count) h.postMessage({ type: "job", id, index: next++ } satisfies ToWorker);
+  };
+  showStage(id, `Checking parts 0 of ${count}\u2026`);
+  for (let n = 0; n < Math.min(HELPERS, count); n++) {
+    const h = new Worker(new URL("../worker/worker.ts", import.meta.url), { type: "module" });
+    helpers.push(h);
+    h.onerror = () => finish(false);
+    h.onmessage = (ev: MessageEvent<FromWorker>) => {
+      const m = ev.data;
+      if (m.type === "ready") {
+        const copy = source.slice(0);
+        h.postMessage({ type: "prep", id, buffer: copy, kind } satisfies ToWorker, [copy]);
+      } else if (m.type === "prepared") {
+        if (m.count === count) assign(h);
+        else finish(false);
+      } else if (m.type === "entry") {
+        entries.push(m.entry);
+        if (entries.length === count) {
+          showStage(id, "Finishing the whole-model check\u2026");
+          finish(true);
+        } else {
+          showStage(id, `Checking parts ${entries.length} of ${count}\u2026`);
+          assign(h);
+        }
+      } else if (m.type === "error" || m.type === "initError") {
+        finish(false);
+      }
+    };
+    h.postMessage({ type: "init" } satisfies ToWorker);
+  }
+}
+
 function boot() {
   ready = false;
   worker = new Worker(new URL("../worker/worker.ts", import.meta.url), { type: "module" });
@@ -96,16 +157,12 @@ function onMessage(ev: MessageEvent<FromWorker>) {
       waiter?.ok(new File([msg.buffer], msg.name));
       break;
     }
-    case "stage": {
-      const it = items.find((i) => i.id === msg.id);
-      if (it) {
-        it.stage = msg.text;
-        // Update the badge in place; a full re-render would be wasteful while the worker is busy.
-        const badge = document.querySelector(`[data-id="${it.id}"]`)?.closest(".card")?.querySelector(".badge.wait");
-        if (badge) badge.textContent = msg.text;
-      }
+    case "stage":
+      showStage(msg.id, msg.text);
       break;
-    }
+    case "needKids":
+      runKids(msg.id, msg.count, msg.buffer, msg.kind);
+      break;
     case "result": {
       const it = items.find((i) => i.id === msg.id);
       busy = false;

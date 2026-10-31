@@ -4,7 +4,7 @@ import { buildFcTree, finalShapes, parseDocumentXml } from "../lib/fcstdDoc";
 import { PER_CHILD_CODES, REEXPORT_CODES } from "../lib/limits";
 import { parseStepText } from "../lib/stepText";
 import { signatureOf } from "../lib/uniqueness";
-import type { ChildReport, Failure, FcstdInfo, Format, Measures, Report, SampleKind, Signature, TreeNode } from "../lib/types";
+import type { ChildReport, Failure, FcstdInfo, Format, KidEntry, KidKind, Measures, Report, SampleKind, Signature, TreeNode } from "../lib/types";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 type OC = any;
@@ -64,6 +64,25 @@ async function sha256Hex(bytes: Uint8Array): Promise<string> {
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+/** Assemblies with at least this many parts are checked on helper workers, when the page offers them. */
+const PARALLEL_MIN_PARTS = 8;
+
+interface Part {
+  name: string;
+  shape: Shape;
+}
+
+/** Fold per-part outcomes into unique parts with counts, in order of first appearance. */
+function mergeKids(entries: KidEntry[]): ChildReport[] {
+  const groups = new Map<string, KidEntry[]>();
+  for (const e of [...entries].sort((a, b) => a.index - b.index)) {
+    const g = groups.get(e.key);
+    if (g) g.push(e);
+    else groups.set(e.key, [e]);
+  }
+  return [...groups.values()].map((g) => ({ ...(g.find((e) => e.kid)?.kid as ChildReport), count: g.length }));
+}
+
 interface ShapeCheck {
   measures: Measures;
   failures: Failure[];
@@ -74,6 +93,10 @@ export class Engine {
   private seq = 0;
   /** Progress hook set by the worker for the file being checked. */
   onStage: (text: string) => void = () => {};
+  /** Set by the worker: have the page check the parts on helper workers. Resolves null if it could not. */
+  requestKids: ((count: number, kind: KidKind, source: Uint8Array) => Promise<KidEntry[] | null>) | null = null;
+  private helperParts: Part[] = [];
+  private helperSeen = new Set<string>();
 
   constructor(private oc: OC) {}
 
@@ -285,25 +308,93 @@ export class Engine {
     };
   }
 
-  /** Measure, evaluate, then re-export to STEP, reopen and compare (validate.py `validate`). */
-  check(shape: Shape, measured?: Measures): ShapeCheck {
-    const measures = measured ?? this.measure(shape);;
-    const failures = evaluate(measures);
-    let reexport: Measures | null = null;
-    const bytes = this.writeStep(shape);;
-    if (!bytes) {
-      failures.push({ code: "reexport_failed", message: "STEP re-export failed" });
-    } else {
-      const shape2 = this.readStep(bytes);;
-      if (!shape2) {
-        failures.push({ code: "reexport_reopen", message: "re-exported STEP failed to reopen" });
-      } else {
-        reexport = this.measure(shape2, "noarea");;
-        failures.push(...compareReexport(measures, reexport));
-        shape2.delete();
-      }
+  /** Re-export to STEP, reopen and measure what came back (validate.py `validate`). */
+  private reexportOf(shape: Shape): { measures: Measures | null; failures: Failure[] } {
+    const bytes = this.writeStep(shape);
+    if (!bytes) return { measures: null, failures: [{ code: "reexport_failed", message: "STEP re-export failed" }] };
+    const shape2 = this.readStep(bytes);
+    if (!shape2) return { measures: null, failures: [{ code: "reexport_reopen", message: "re-exported STEP failed to reopen" }] };
+    try {
+      return { measures: this.measure(shape2, "noarea"), failures: [] };
+    } finally {
+      shape2.delete();
     }
-    return { measures, failures: dropReexportEchoes(failures), reexport };
+  }
+
+  private verdict(measures: Measures, rx: { measures: Measures | null; failures: Failure[] }): ShapeCheck {
+    const failures = evaluate(measures);
+    failures.push(...rx.failures);
+    if (rx.measures) failures.push(...compareReexport(measures, rx.measures));
+    return { measures, failures: dropReexportEchoes(failures), reexport: rx.measures };
+  }
+
+  /** Measure, evaluate, then re-export and compare. */
+  check(shape: Shape, measured?: Measures): ShapeCheck {
+    return this.verdict(measured ?? this.measure(shape), this.reexportOf(shape));
+  }
+
+  /** One part: measure, and run the full check unless an identical part was already checked in `seen`. */
+  private checkPart(c: Part, index: number, seen: Set<string>): KidEntry {
+    const m = this.measure(c.shape);
+    const key = [m.faces, round(m.volume, 3), m.bboxDimsSorted.join("x")].join("|");
+    if (seen.has(key)) return { index, key, kid: null };
+    seen.add(key);
+    const chk = this.check(c.shape, m);
+    const kid: ChildReport = {
+      name: c.name,
+      count: 1,
+      measures: chk.measures,
+      failures: chk.failures,
+      passed: chk.failures.length === 0,
+      signature: signatureOf(chk.measures),
+    };
+    return { index, key, kid };
+  }
+
+  /* ---------- helper-worker side of a parallel run ---------- */
+
+  /** Parse the file and list its parts exactly as the main worker does, so indices agree. Returns the part count. */
+  prepare(bytes: Uint8Array, kind: KidKind): number {
+    this.helperSeen = new Set();
+    if (kind === "step") {
+      const shape = this.readStep(bytes);
+      if (!shape) throw new Error("STEP parse failed");
+      this.helperParts = this.stepParts(shape);
+    } else {
+      const { leaves, files } = this.fcstdLeaves(bytes);
+      this.helperParts = this.readLeaves(files, leaves, []);
+    }
+    return this.helperParts.length;
+  }
+
+  runJob(index: number): KidEntry {
+    return this.checkPart(this.helperParts[index], index, this.helperSeen);
+  }
+
+  private stepParts(shape: Shape): Part[] {
+    const parts: Part[] = [];
+    this.each(shape, "TopAbs_SOLID", (cur, i) => {
+      // Keep a handle that outlives the explorer by wrapping the solid in a one-item compound.
+      parts.push({ name: `Solid ${i + 1}`, shape: this.compound([cur]) });
+    });
+    return parts;
+  }
+
+  private fcstdLeaves(bytes: Uint8Array) {
+    const files = unzipSync(bytes);
+    const doc = parseDocumentXml(strFromU8(files["Document.xml"]));
+    const leaves = finalShapes(doc.objects).filter((o) => o.shapeFile && files[o.shapeFile]);
+    return { files, doc, leaves };
+  }
+
+  private readLeaves(files: Record<string, Uint8Array>, leaves: { label: string; shapeFile: string | null }[], notes: string[]): Part[] {
+    const shapes: Part[] = [];
+    for (const leaf of leaves) {
+      const s = this.readBrep(files[leaf.shapeFile!]);
+      if (s) shapes.push({ name: leaf.label, shape: s });
+      else notes.push(`Could not read the stored shape of "${leaf.label}".`);
+    }
+    return shapes;
   }
 
   /* ---------- whole-file flows ---------- */
@@ -348,7 +439,7 @@ export class Engine {
     const ext = lower.slice(lower.lastIndexOf("."));
     // "Changing .step to .prt is only renaming" (handbook): trust the bytes, not the extension.
     if (truth === "step" && format !== "step") {
-      const r = this.validateStep({ ...base, format: "step" }, bytes);
+      const r = await this.validateStep({ ...base, format: "step" }, bytes);
       return finish({
         ...r,
         failures: [{ code: "renamed", message: `This is a STEP exchange file saved with a ${ext} extension. Renaming does not make it native CAD and it carries no design history (class C).` }, ...r.failures],
@@ -358,7 +449,7 @@ export class Engine {
       return finish({ ...base, failures: [{ code: "syntax", message: `This ${truth === "zip" ? "zip archive" : "OLE container"} is a native CAD file renamed to ${ext}. A STEP file is plain text starting with ISO-10303-21; export a real STEP from the CAD tool.` }] });
     }
     if (native) return finish(this.identifyNative(base, bytes, native));
-    return finish(format === "step" ? this.validateStep(base, bytes) : this.validateFcstd(base, bytes));
+    return finish(format === "step" ? await this.validateStep(base, bytes) : await this.validateFcstd(base, bytes));
   }
 
   /** Proprietary CAD formats cannot be read by any open browser-side kernel: identify, do not pretend to validate. */
@@ -375,7 +466,7 @@ export class Engine {
     };
   }
 
-  private validateStep(base: Report, bytes: Uint8Array): Report {
+  private async validateStep(base: Report, bytes: Uint8Array): Promise<Report> {
     const text = new TextDecoder("utf-8").decode(bytes);
     const structure = parseStepText(text);
     const r: Report = {
@@ -395,24 +486,20 @@ export class Engine {
     if (!shape) return { ...r, failures: [{ code: "parse", message: "STEP parse failed" }] };
     try {
       if (structure.role === "PARENT") {
-        const children: { name: string; shape: Shape }[] = [];
-        this.each(shape, "TopAbs_SOLID", (cur, i) => {
-          // Keep a handle that outlives the explorer by wrapping the solid in a one-item compound.
-          children.push({ name: `Solid ${i + 1}`, shape: this.compound([cur]) });
-        });
+        const children = this.stepParts(shape);
         try {
-          return this.assemble({ ...r, parsed: true }, shape, children);
+          return await this.assemble({ ...r, parsed: true }, shape, children, { kind: "step", bytes });
         } finally {
           for (const c of children) c.shape.delete();
         }
       }
-      return this.assemble({ ...r, parsed: true }, shape, null);
+      return await this.assemble({ ...r, parsed: true }, shape, null);
     } finally {
       shape.delete();
     }
   }
 
-  private validateFcstd(base: Report, bytes: Uint8Array): Report {
+  private async validateFcstd(base: Report, bytes: Uint8Array): Promise<Report> {
     if (bytes[0] !== 0x50 || bytes[1] !== 0x4b) {
       return { ...base, failures: [{ code: "syntax", message: "Not a valid .FCStd (a FreeCAD file is a zip archive)." }] };
     }
@@ -437,12 +524,7 @@ export class Engine {
     }
     const r: Report = { ...base, fileClass: doc.info.designClass, fcstd, notes, tree: buildFcTree(doc.objects, leaves) };
 
-    const shapes: { name: string; shape: Shape }[] = [];
-    for (const leaf of leaves) {
-      const s = this.readBrep(files[leaf.shapeFile!]);
-      if (s) shapes.push({ name: leaf.label, shape: s });
-      else notes.push(`Could not read the stored shape of "${leaf.label}".`);
-    }
+    const shapes = this.readLeaves(files, leaves, notes);
     if (!shapes.length) {
       return {
         ...r,
@@ -450,10 +532,10 @@ export class Engine {
       };
     }
     try {
-      if (shapes.length === 1) return this.assemble({ ...r, parsed: true, parts: 1, uniqueParts: 1 }, shapes[0].shape, null);
+      if (shapes.length === 1) return await this.assemble({ ...r, parsed: true, parts: 1, uniqueParts: 1 }, shapes[0].shape, null);
       const whole = this.compound(shapes.map((s) => s.shape));
       try {
-        return this.assemble({ ...r, parsed: true, role: "PARENT", levels: r.tree ? treeDepth(r.tree) : 1, parts: shapes.length }, whole, shapes);
+        return await this.assemble({ ...r, parsed: true, role: "PARENT", levels: r.tree ? treeDepth(r.tree) : 1, parts: shapes.length }, whole, shapes, { kind: "fcstd", bytes });
       } finally {
         whole.delete();
       }
@@ -463,7 +545,7 @@ export class Engine {
   }
 
   /** Shared tail: whole-file check, then per-child checks for assemblies. */
-  private assemble(r: Report, whole: Shape, children: { name: string; shape: Shape }[] | null): Report {
+  private async assemble(r: Report, whole: Shape, children: Part[] | null, source?: { kind: KidKind; bytes: Uint8Array }): Promise<Report> {
     if (!children) {
       this.onStage("Checking the whole model\u2026");
       const overall = this.check(whole);
@@ -475,33 +557,29 @@ export class Engine {
       return this.withPreview(out, whole);
     }
 
-    // Spec rules apply to every child; the parent file itself must be a valid, closed, re-exportable B-rep.
-    const grouped = new Map<string, ChildReport>();
-    for (const [i, c] of children.entries()) {
-      this.onStage(`Checking part ${i + 1} of ${children.length}\u2026`);
-      const m = this.measure(c.shape);
-      const key = [m.faces, round(m.volume, 3), m.bboxDimsSorted.join("x")].join("|");
-      const seen = grouped.get(key);
-      if (seen) {
-        seen.count++;
-        continue;
-      }
-      const chk = this.check(c.shape, m);
-      grouped.set(key, {
-        name: c.name,
-        count: 1,
-        measures: chk.measures,
-        failures: chk.failures,
-        passed: chk.failures.length === 0,
-        signature: signatureOf(chk.measures),
+    // Many parts: helper workers check them while this one does the whole-model passes. The page narrates progress then.
+    const asked = source && this.requestKids && children.length >= PARALLEL_MIN_PARTS ? this.requestKids(children.length, source.kind, source.bytes) : null;
+    const checkLocally = () => {
+      const seen = new Set<string>();
+      return children.map((c, i) => {
+        this.onStage(`Checking part ${i + 1} of ${children.length}\u2026`);
+        return this.checkPart(c, i, seen);
       });
-    }
-    const kids = [...grouped.values()];
+    };
+    let entries: KidEntry[] | null = asked ? null : checkLocally();
+
+    // The re-export round trip does not depend on the parts, so it can run first.
+    if (!asked) this.onStage("Checking the whole model\u2026");
+    const light = this.measure(whole, "light");
+    const rx = this.reexportOf(whole);
+    // Meshing adds triangulation that inflates later bounding boxes, so with local parts it waits until they are
+    // measured; helpers hold their own shapes, so there the mesh goes on a copy and the original stays clean.
+    const early = asked ? this.buildPreview(whole, light.longest, true) : null;
+    entries ??= (await asked) ?? checkLocally();
+    const kids = mergeKids(entries);
 
     // A compound is valid when every part is, and its volume and area are the parts' sums, so the whole-model
     // pass only measures what the parts cannot tell: counts, bounding box and free edges.
-    this.onStage("Checking the whole model\u2026");
-    const light = this.measure(whole, "light");
     const sum = (pick: (m: Measures) => number) => kids.reduce((t, k) => t + pick(k.measures) * k.count, 0);
     const measures: Measures = {
       ...light,
@@ -509,7 +587,7 @@ export class Engine {
       area: sum((m) => m.area),
       validBrep: kids.every((k) => k.measures.validBrep),
     };
-    const overall = this.check(whole, measures);
+    const overall = this.verdict(measures, rx);
     let out: Report = { ...r, measures: overall.measures, reexport: overall.reexport };
     const parentFails = overall.failures.filter((f) => !isPerChildFailure(f, PER_CHILD_CODES));
     const failures = [...parentFails, ...kids.flatMap((k) => k.failures.map((f) => ({ code: `child:${f.code}`, message: `child ${k.name}: ${f.message}` })))];
@@ -525,16 +603,25 @@ export class Engine {
       signatures: kids.filter((k) => k.signature).map((k) => ({ label: k.name, signature: k.signature as Signature })),
     };
     if (!out.tree) out.tree = this.flatTree(r.file, kids);
-    return this.withPreview(out, whole);
+    return this.withPreview(out, whole, early ?? undefined);
   }
 
   /** Tessellate last: meshing adds triangulation to the shape, which would perturb the measurements above. */
-  private withPreview(out: Report, whole: Shape): Report {
-    this.onStage("Building the 3D view\u2026");
+  private withPreview(out: Report, whole: Shape, built?: { preview: Float32Array | null; note?: string }): Report {
+    if (!built) {
+      this.onStage("Building the 3D view\u2026");
+      built = this.buildPreview(whole, out.measures?.longest ?? 0);
+    }
+    return built.note ? { ...out, notes: [...out.notes, built.note] } : { ...out, preview: built.preview };
+  }
+
+  private buildPreview(whole: Shape, longest: number, onCopy = false): { preview: Float32Array | null; note?: string } {
     try {
-      return { ...out, preview: this.tessellate(whole, out.measures?.longest ?? 0) };
+      // Never delete the maker: the shape it returns is owned by it.
+      const target = onCopy ? new this.oc.BRepBuilderAPI_Copy_2(whole, true, false).Shape() : whole;
+      return { preview: this.tessellate(target, longest) };
     } catch {
-      return { ...out, notes: [...out.notes, "The 3D view could not be built for this file."] };
+      return { preview: null, note: "The 3D view could not be built for this file." };
     }
   }
 
