@@ -185,7 +185,11 @@ export class Engine {
 
   /* ---------- validate.py: measure ---------- */
 
-  measure(shape: Shape): Measures {
+  /**
+   * "noarea" skips the surface integral (only the uniqueness signature needs it). "light" also skips volume and the
+   * B-rep check, the slow parts: an assembly's parent takes those from its parts instead.
+   */
+  measure(shape: Shape, mode: "full" | "noarea" | "light" = "full"): Measures {
     const oc = this.oc;
     const faceTypes: Record<string, number> = {};
     let faces = 0;
@@ -223,10 +227,11 @@ export class Engine {
     box.delete();
 
     const vp = new oc.GProp_GProps_1();
-    oc.BRepGProp.VolumeProperties_1(shape, vp, false, false, false);
-    const volume: number = vp.Mass();
+    if (mode !== "light") oc.BRepGProp.VolumeProperties_1(shape, vp, false, false, false);
+    const volume: number = mode === "light" ? 0 : vp.Mass();
     let moments: number[] = [0, 0, 0];
     try {
+      if (mode === "light") throw new Error("not measured");
       const mat = vp.MatrixOfInertia();
       moments = symmetricEigenvalues([1, 2, 3].map((r) => [1, 2, 3].map((c) => mat.Value(r, c))));
       mat.delete();
@@ -235,10 +240,13 @@ export class Engine {
     }
     vp.delete();
 
-    const sp = new oc.GProp_GProps_1();
-    oc.BRepGProp.SurfaceProperties_1(shape, sp, false, false);
-    const area: number = sp.Mass();
-    sp.delete();
+    let area = 0;
+    if (mode === "full") {
+      const sp = new oc.GProp_GProps_1();
+      oc.BRepGProp.SurfaceProperties_1(shape, sp, false, false);
+      area = sp.Mass();
+      sp.delete();
+    }
 
     let freeEdges = 0;
     try {
@@ -249,12 +257,14 @@ export class Engine {
       freeEdges = -1;
     }
 
-    let validBrep = false;
-    const analyzer = new oc.BRepCheck_Analyzer(shape, true);
-    try {
-      validBrep = analyzer.IsValid_2();
-    } finally {
-      analyzer.delete();
+    let validBrep = mode === "light";
+    if (mode !== "light") {
+      const analyzer = new oc.BRepCheck_Analyzer(shape, true);
+      try {
+        validBrep = analyzer.IsValid_2();
+      } finally {
+        analyzer.delete();
+      }
     }
 
     const longest = dims[2];
@@ -276,19 +286,19 @@ export class Engine {
   }
 
   /** Measure, evaluate, then re-export to STEP, reopen and compare (validate.py `validate`). */
-  check(shape: Shape): ShapeCheck {
-    const measures = this.measure(shape);
+  check(shape: Shape, measured?: Measures): ShapeCheck {
+    const measures = measured ?? this.measure(shape);;
     const failures = evaluate(measures);
     let reexport: Measures | null = null;
-    const bytes = this.writeStep(shape);
+    const bytes = this.writeStep(shape);;
     if (!bytes) {
       failures.push({ code: "reexport_failed", message: "STEP re-export failed" });
     } else {
-      const shape2 = this.readStep(bytes);
+      const shape2 = this.readStep(bytes);;
       if (!shape2) {
         failures.push({ code: "reexport_reopen", message: "re-exported STEP failed to reopen" });
       } else {
-        reexport = this.measure(shape2);
+        reexport = this.measure(shape2, "noarea");;
         failures.push(...compareReexport(measures, reexport));
         shape2.delete();
       }
@@ -454,12 +464,11 @@ export class Engine {
 
   /** Shared tail: whole-file check, then per-child checks for assemblies. */
   private assemble(r: Report, whole: Shape, children: { name: string; shape: Shape }[] | null): Report {
-    this.onStage("Checking the whole model\u2026");
-    const overall = this.check(whole);
-    const sig = signatureOf(overall.measures);
-    let out: Report = { ...r, measures: overall.measures, reexport: overall.reexport };
-
     if (!children) {
+      this.onStage("Checking the whole model\u2026");
+      const overall = this.check(whole);
+      const sig = signatureOf(overall.measures);
+      let out: Report = { ...r, measures: overall.measures, reexport: overall.reexport };
       const failures = overall.failures;
       out = { ...out, failures, reexportOk: this.reexportOk(failures, overall.reexport) };
       if (sig) out.signatures = [{ label: r.file, signature: sig }];
@@ -477,7 +486,7 @@ export class Engine {
         seen.count++;
         continue;
       }
-      const chk = this.check(c.shape);
+      const chk = this.check(c.shape, m);
       grouped.set(key, {
         name: c.name,
         count: 1,
@@ -488,6 +497,20 @@ export class Engine {
       });
     }
     const kids = [...grouped.values()];
+
+    // A compound is valid when every part is, and its volume and area are the parts' sums, so the whole-model
+    // pass only measures what the parts cannot tell: counts, bounding box and free edges.
+    this.onStage("Checking the whole model\u2026");
+    const light = this.measure(whole, "light");
+    const sum = (pick: (m: Measures) => number) => kids.reduce((t, k) => t + pick(k.measures) * k.count, 0);
+    const measures: Measures = {
+      ...light,
+      volume: sum((m) => m.volume),
+      area: sum((m) => m.area),
+      validBrep: kids.every((k) => k.measures.validBrep),
+    };
+    const overall = this.check(whole, measures);
+    let out: Report = { ...r, measures: overall.measures, reexport: overall.reexport };
     const parentFails = overall.failures.filter((f) => !isPerChildFailure(f, PER_CHILD_CODES));
     const failures = [...parentFails, ...kids.flatMap((k) => k.failures.map((f) => ({ code: `child:${f.code}`, message: `child ${k.name}: ${f.message}` })))];
     out = {

@@ -33,7 +33,7 @@ app.innerHTML = `
     <div class="list-head" id="listHead" hidden><span id="summary"></span><button class="ghost" id="clear">Clear all</button></div>
     <div id="results" aria-live="polite"></div>
   </main>
-  <footer>Rules follow the Kuinbee spec as implemented in <code>validator/validate.py</code>: face count, solids, analytic surfaces, proportions, feature size, B-rep validity, gaps, STEP round-trip.</footer>`;
+ `;
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 const engineEl = $("engine");
@@ -41,7 +41,9 @@ const resultsEl = $("results");
 
 /* ---------- worker ---------- */
 
-const worker = new Worker(new URL("../worker/worker.ts", import.meta.url), { type: "module" });
+/** A file this slow leaves the engine's WASM heap bloated, which slows or stalls the next one: start a fresh engine. */
+const RECYCLE_AFTER_MS = 30_000;
+let worker: Worker;
 const send = (msg: ToWorker, transfer: Transferable[] = []) => worker.postMessage(msg, transfer);
 let ready = false;
 const registry = new UniquenessRegistry();
@@ -56,10 +58,18 @@ function setEngine(html: string, cls = "") {
   engineEl.className = `engine ${cls}`;
   engineEl.innerHTML = html;
 }
-setEngine('<span class="spin"></span> Starting geometry engine…');
-send({ type: "init" });
+let startedAt = 0;
 
-worker.onmessage = (ev: MessageEvent<FromWorker>) => {
+function boot() {
+  ready = false;
+  worker = new Worker(new URL("../worker/worker.ts", import.meta.url), { type: "module" });
+  worker.onmessage = onMessage;
+  worker.onerror = (e) => setEngine(`Engine crashed: ${esc(e.message)}`, "bad");
+  setEngine('<span class="spin"></span> Starting geometry engine…');
+  send({ type: "init" });
+}
+
+function onMessage(ev: MessageEvent<FromWorker>) {
   const msg = ev.data;
   switch (msg.type) {
     case "progress": {
@@ -109,6 +119,10 @@ worker.onmessage = (ev: MessageEvent<FromWorker>) => {
       }
       buffers.delete(msg.id);
       render();
+      if (Date.now() - startedAt > RECYCLE_AFTER_MS) {
+        worker.terminate();
+        boot();
+      }
       pump();
       break;
     }
@@ -131,9 +145,9 @@ worker.onmessage = (ev: MessageEvent<FromWorker>) => {
       break;
     }
   }
-};
+}
 
-worker.onerror = (e) => setEngine(`Engine crashed: ${esc(e.message)}`, "bad");
+boot();
 
 /* ---------- queue ---------- */
 
@@ -144,6 +158,7 @@ function pump() {
   const buffer = buffers.get(next.id);
   if (!buffer) return;
   busy = true;
+  startedAt = Date.now();
   next.status = "running";
   render();
   // Let the "Checking…" state paint first. A timer, not requestAnimationFrame: that never fires in a background tab.
