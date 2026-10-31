@@ -1,4 +1,4 @@
-export type Format = "step" | "fcstd";
+export type Format = "step" | "fcstd" | "native";
 
 export interface Failure {
   code: string;

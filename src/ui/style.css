@@ -97,6 +97,7 @@ button { font: inherit; color: inherit; cursor: pointer; }
 
 .banner { margin: 0 14px 12px; padding: 10px 12px; border-radius: 10px; font-size: 13.5px; }
 .banner.pass { color: var(--pass); background: var(--pass-bg); }
+.banner.warn { color: var(--warn); background: var(--warn-bg); }
 .banner.fail { color: var(--fail); background: var(--fail-bg); }
 .banner ul { margin: 4px 0 0; padding-left: 18px; }
 

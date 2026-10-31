@@ -147,8 +147,11 @@ function fileInfo(r: Report, it: Item): string {
 export function cardHtml(it: Item): string {
   const r = it.report;
   const ext = it.name.split(".").pop()?.toUpperCase() ?? "";
+  const unchecked = r?.format === "native";
   const status =
-    it.status === "done" && r
+    it.status === "done" && r && unchecked
+      ? `<span class="badge big warn">NOT CHECKED</span>`
+      : it.status === "done" && r
       ? `<span class="badge big ${r.passed ? "pass" : "fail"}">${r.passed ? "PASS" : "FAIL"}</span>`
       : it.status === "error"
         ? `<span class="badge big fail">ERROR</span>`
@@ -165,9 +168,9 @@ export function cardHtml(it: Item): string {
   if (it.status === "error") return `<article class="card">${head}<div class="banner fail">${esc(it.error ?? "Validation failed.")}</div></article>`;
   if (!r) return `<article class="card">${head}${it.status === "running" ? '<div class="bar"><i></i></div>' : ""}</article>`;
 
-  const hard = r.failures.filter((f) => ["format", "syntax", "parse"].includes(f.code));
+  const hard = r.failures.filter((f) => ["format", "syntax", "parse", "native"].includes(f.code));
   if (!r.parsed || hard.length) {
-    return `<article class="card">${head}<div class="banner fail">${hard.map((f) => esc(f.message)).join("<br>") || "File could not be read."}</div>${fileInfo(r, it)}</article>`;
+    return `<article class="card">${head}<div class="banner ${unchecked ? "warn" : "fail"}">${hard.map((f) => esc(f.message)).join("<br>") || "File could not be read."}</div>${fileInfo(r, it)}</article>`;
   }
 
   const shown = r.failures;

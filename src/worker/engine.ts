@@ -10,6 +10,21 @@ import type { ChildReport, Failure, FcstdInfo, Format, Measures, Report, SampleK
 type OC = any;
 type Shape = any;
 
+interface NativeFormat {
+  ext: string;
+  label: string;
+  app: string;
+  exportHint: string;
+  container: "ole" | "zip" | "any";
+}
+
+const NATIVE: NativeFormat[] = [
+  { ext: ".sldprt", label: "SolidWorks .SLDPRT", app: "SolidWorks", exportHint: "use File \u203a Save As \u203a STEP AP214 or AP242", container: "ole" },
+  { ext: ".prt", label: "Siemens NX .PRT", app: "NX (or Creo)", exportHint: "use File \u203a Export \u203a STEP214 or STEP242", container: "any" },
+  { ext: ".f3d", label: "Fusion .F3D", app: "Fusion", exportHint: "use File \u203a Export \u203a STEP", container: "zip" },
+  { ext: ".ipt", label: "Inventor .IPT", app: "Inventor", exportHint: "use Save Copy As \u203a STEP", container: "ole" },
+];
+
 const ANALYTIC: Record<number, string> = { 0: "plane", 1: "cylinder", 2: "cone", 3: "sphere", 4: "torus" };
 
 const round = (x: number, d: number) => Math.round(x * 10 ** d) / 10 ** d;
@@ -275,7 +290,8 @@ export class Engine {
     const t0 = performance.now();
     const bytes = new Uint8Array(buffer);
     const lower = name.toLowerCase();
-    const format: Format | null = /\.(step|stp)$/.test(lower) ? "step" : lower.endsWith(".fcstd") ? "fcstd" : null;
+    const native = NATIVE.find((n) => lower.endsWith(n.ext));
+    const format: Format | null = /\.(step|stp)$/.test(lower) ? "step" : lower.endsWith(".fcstd") ? "fcstd" : native ? "native" : null;
     const base: Report = {
       file: name,
       size: bytes.length,
@@ -302,9 +318,24 @@ export class Engine {
     const finish = (r: Report): Report => ({ ...r, passed: r.parsed && r.failures.length === 0, elapsedMs: Math.round(performance.now() - t0) });
 
     if (!format) {
-      return finish({ ...base, failures: [{ code: "format", message: "Only .step, .stp and .FCStd files are supported." }] });
+      return finish({ ...base, failures: [{ code: "format", message: "Supported files: .step, .stp, .FCStd (checked) and .SLDPRT, .PRT, .F3D, .IPT (identified only)." }] });
     }
+    if (native) return finish(this.identifyNative(base, bytes, native));
     return finish(format === "step" ? this.validateStep(base, bytes) : this.validateFcstd(base, bytes));
+  }
+
+  /** Proprietary CAD formats cannot be read by any open browser-side kernel: identify, do not pretend to validate. */
+  private identifyNative(base: Report, bytes: Uint8Array, n: NativeFormat): Report {
+    const ole = [0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1].every((b, i) => bytes[i] === b);
+    const zip = bytes[0] === 0x50 && bytes[1] === 0x4b;
+    const container = ole ? "OLE compound file" : zip ? "zip archive" : "unrecognised container";
+    const expected = n.container === "ole" ? ole : n.container === "zip" ? zip : ole || zip;
+    const notes = [`Detected ${container}${expected ? ", as expected for this format" : `; ${n.label} files are normally ${n.container === "zip" ? "a zip archive" : n.container === "ole" ? "an OLE compound file" : "an OLE or zip container"}, so this file may be damaged or mislabelled`}.`];
+    return {
+      ...base,
+      notes,
+      failures: [{ code: "native", message: `${n.label} is a proprietary format whose geometry cannot be read in a browser, so none of the rules were run. In ${n.app}, ${n.exportHint}, then drop the STEP file here.` }],
+    };
   }
 
   private validateStep(base: Report, bytes: Uint8Array): Report {

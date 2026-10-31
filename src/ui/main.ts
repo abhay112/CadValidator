@@ -5,7 +5,7 @@ import { bytesLabel, esc } from "./format";
 import { cardHtml, type Item } from "./render";
 
 const MAX_BYTES = 150 * 1024 * 1024;
-const ACCEPT = /\.(step|stp|fcstd)$/i;
+const ACCEPT = /\.(step|stp|fcstd|sldprt|prt|f3d|ipt)$/i;
 
 const app = document.querySelector<HTMLDivElement>("#app")!;
 app.innerHTML = `
@@ -16,7 +16,7 @@ app.innerHTML = `
   </header>
   <main>
     <label class="drop" id="drop" for="file">
-      <input id="file" type="file" accept=".step,.stp,.fcstd,.FCStd" multiple />
+      <input id="file" type="file" accept=".step,.stp,.fcstd,.FCStd,.sldprt,.prt,.f3d,.ipt" multiple />
       <svg viewBox="0 0 24 24" width="30" height="30" aria-hidden="true"><path d="M12 16V4m0 0L7 9m5-5l5 5M4 16v3a1 1 0 001 1h14a1 1 0 001-1v-3" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
       <span class="t">Drop <b>.step</b>, <b>.stp</b> or <b>.FCStd</b> files here</span>
       <span class="s">or click to browse · several files at once is fine</span>
@@ -141,7 +141,7 @@ async function addFiles(files: FileList | File[]) {
   for (const file of Array.from(files)) {
     const id = nextId++;
     if (!ACCEPT.test(file.name)) {
-      items.unshift({ id, name: file.name, size: file.size, status: "error", error: "Only .step, .stp and .FCStd files are supported." });
+      items.unshift({ id, name: file.name, size: file.size, status: "error", error: "Supported: .step, .stp, .FCStd, .SLDPRT, .PRT, .F3D, .IPT." });
     } else if (file.size > MAX_BYTES) {
       items.unshift({ id, name: file.name, size: file.size, status: "error", error: `File is ${bytesLabel(file.size)}; the in-browser limit is ${bytesLabel(MAX_BYTES)}.` });
     } else {
@@ -172,9 +172,10 @@ function render() {
   resultsEl.innerHTML = items.map(cardHtml).join("");
   const done = items.filter((i) => i.report);
   const pass = done.filter((i) => i.report!.passed).length;
+  const unchecked = done.filter((i) => i.report!.format === "native").length;
   $("listHead").hidden = items.length === 0;
   $("summary").textContent = items.length
-    ? `${items.length} file${items.length === 1 ? "" : "s"}${done.length ? ` · ${pass} passed · ${done.length - pass} failed` : ""}`
+    ? `${items.length} file${items.length === 1 ? "" : "s"}${done.length ? ` · ${pass} passed · ${done.length - pass - unchecked} failed${unchecked ? ` · ${unchecked} not checked` : ""}` : ""}`
     : "";
 }
 

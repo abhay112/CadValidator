@@ -49,6 +49,12 @@ An `.FCStd` is a zip. The app reads `Document.xml` for the object tree and desig
 `*.brp` shapes of each Body (or of each finished Part feature when there is no Body) for geometry checks.
 The design class is shown but does not fail a file. Models saved without their cached shapes cannot be checked.
 
+## Other CAD formats
+
+`.SLDPRT` (SolidWorks), `.PRT` (NX/Creo), `.F3D` (Fusion) and `.IPT` (Inventor) are accepted but only
+identified (container sanity check, SHA-256) and reported as **NOT CHECKED**. Their geometry is proprietary
+and no open kernel can read it in a browser; the report tells the user how to export STEP from that tool.
+
 ## Layout
 
 ```
