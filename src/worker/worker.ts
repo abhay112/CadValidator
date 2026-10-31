@@ -69,6 +69,7 @@ self.onmessage = async (ev: MessageEvent<ToWorker>) => {
   }
   try {
     if (msg.type === "validate") {
+      engine.onStage = (text) => post({ type: "stage", id: msg.id, text });
       post({ type: "result", id: msg.id, report: await engine.validate(msg.name, msg.buffer) });
     } else if (msg.type === "sample") {
       const s = engine.sample(msg.kind);

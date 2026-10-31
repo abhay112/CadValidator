@@ -27,6 +27,9 @@ export function evaluate(m: Measures): Failure[] {
         `${Math.round(MIN_FEATURE_FRACTION * 100)}% of longest dim ${m.longest.toFixed(3)}`,
     });
   }
+  if (m.solids > 0 && m.shells > m.solids) {
+    fails.push({ code: "cavity", message: `${m.shells - m.solids} internal void shell(s): hidden cavities are rejected` });
+  }
   if (!m.validBrep) fails.push({ code: "invalid_brep", message: "BRepCheck reports invalid shape" });
   if (m.freeEdges !== 0) {
     fails.push({ code: "free_edges", message: `free edges (gaps/open shell): ${m.freeEdges}` });

@@ -12,6 +12,7 @@ export interface Item {
   error?: string;
   matches?: Match[];
   comparedWith?: number;
+  stage?: string;
 }
 
 const AFTER = "after_reexport:";
@@ -38,6 +39,8 @@ function measured(code: string, m: Measures, fails: Failure[]): string {
       if (!sf) return "no radii found";
       return `${sf.kind.replace(/_/g, " ")} ${fmt(sf.size)} (${fmt((sf.size / m.longest) * 100, 1)}%)`;
     }
+    case "cavity":
+      return m.shells > m.solids ? `${m.shells - m.solids} void shell(s)` : "none";
     case "invalid_brep":
       return m.validBrep ? "valid" : "invalid";
     case "free_edges":
@@ -122,6 +125,7 @@ function fileInfo(r: Report, it: Item): string {
     out.push(
       row("Schema", esc(s.schema ?? "—")),
       row("Exported by", esc(s.originatingSystem ?? "—")),
+      row("Units", esc(s.units ? `${s.units}${s.units === "mm" ? "" : " (converted to mm for the checks)"}` : "not declared (assumed mm)")),
       row("STEP entities", esc(`${s.counts.solids} solid B-rep · ${s.counts.faces} advanced faces · ${s.counts.products} products · ${s.counts.assemblyLinks} assembly links`)),
     );
   }
@@ -155,10 +159,10 @@ export function cardHtml(it: Item): string {
       ? `<span class="badge big ${r.passed ? "pass" : "fail"}">${r.passed ? "PASS" : "FAIL"}</span>`
       : it.status === "error"
         ? `<span class="badge big fail">ERROR</span>`
-        : `<span class="badge big wait">${it.status === "running" ? "Checking…" : "Queued"}</span>`;
+        : `<span class="badge big wait">${it.status === "running" ? esc(it.stage ?? "Checking…") : "Queued"}</span>`;
   const head = `<header class="card-head">
     <div class="ftype" aria-hidden="true">${esc(ext.slice(0, 5))}</div>
-    <div class="fname"><div class="n" title="${esc(it.name)}">${esc(it.name)}</div><div class="m">${bytesLabel(it.size)}${r?.role === "PARENT" ? " · assembly" : ""}${r?.fcstd ? ` · design history class ${r.fcstd.designClass}` : ""}</div></div>
+    <div class="fname"><div class="n" title="${esc(it.name)}">${esc(it.name)}</div><div class="m">${bytesLabel(it.size)}${r?.role === "PARENT" ? " · assembly" : ""}${r?.fileClass ? ` · class ${r.fileClass} ${({ A: "native parametric", B: "native geometry-only", C: "STEP exchange" } as const)[r.fileClass]}` : ""}</div></div>
     ${status}
     <div class="acts">
       ${r ? `<button class="ghost" data-act="json" data-id="${it.id}" title="Download JSON report">JSON</button>` : ""}
@@ -184,7 +188,10 @@ export function cardHtml(it: Item): string {
          ${r.tree ? `<ul class="tree root">${treeHtml(r.tree)}</ul>` : ""}${childrenTable(r.children)}</section>`
       : "";
 
-  return `<article class="card">${head}${summary}
+  const view = r.preview
+    ? `<section><h3>3D model <span class="meta">${fmt(r.preview.length / 9, 0)} triangles · drag to rotate, scroll to zoom, right-drag to pan <button class="ghost" data-act="reset" data-id="${it.id}">Reset view</button></span></h3><div class="viewer-slot" data-id="${it.id}"></div></section>`
+    : "";
+  return `<article class="card">${head}${summary}${view}
     <section><h3>Checks <span class="meta">${r.role === "PARENT" ? "assembly: geometry rules apply to each part" : `${MIN_FACES}–${MAX_FACES} faces · ≤${MAX_SOLIDS} solids · aspect ≤${MAX_ASPECT} · features ≥${MIN_FEATURE_FRACTION * 100}%`}</span></h3>${checksTable(r)}</section>
     ${assembly}
     <section><h3>Measurements${r.role === "PARENT" ? ' <span class="meta">whole assembly</span>' : ""}</h3>${measurements(r)}</section>

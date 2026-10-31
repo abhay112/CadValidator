@@ -3,8 +3,10 @@ import type { FromWorker, SampleKind, ToWorker } from "../lib/types";
 import { UniquenessRegistry } from "../lib/uniqueness";
 import { bytesLabel, esc } from "./format";
 import { cardHtml, type Item } from "./render";
+import { Viewer } from "./viewer";
 
 const MAX_BYTES = 150 * 1024 * 1024;
+const MESH = /\.(stl|obj|3mf)$/i;
 const ACCEPT = /\.(step|stp|fcstd|sldprt|prt|f3d|ipt)$/i;
 
 const app = document.querySelector<HTMLDivElement>("#app")!;
@@ -45,6 +47,7 @@ let ready = false;
 const registry = new UniquenessRegistry();
 const items: Item[] = [];
 const buffers = new Map<number, ArrayBuffer>();
+const viewers = new Map<number, Viewer>();
 const sampleWaiters = new Map<number, { ok: (f: File) => void; fail: (message: string) => void }>();
 let nextId = 1;
 let busy = false;
@@ -81,6 +84,16 @@ worker.onmessage = (ev: MessageEvent<FromWorker>) => {
       const waiter = sampleWaiters.get(msg.id);
       sampleWaiters.delete(msg.id);
       waiter?.ok(new File([msg.buffer], msg.name));
+      break;
+    }
+    case "stage": {
+      const it = items.find((i) => i.id === msg.id);
+      if (it) {
+        it.stage = msg.text;
+        // Update the badge in place; a full re-render would be wasteful while the worker is busy.
+        const badge = document.querySelector(`[data-id="${it.id}"]`)?.closest(".card")?.querySelector(".badge.wait");
+        if (badge) badge.textContent = msg.text;
+      }
       break;
     }
     case "result": {
@@ -141,7 +154,7 @@ async function addFiles(files: FileList | File[]) {
   for (const file of Array.from(files)) {
     const id = nextId++;
     if (!ACCEPT.test(file.name)) {
-      items.unshift({ id, name: file.name, size: file.size, status: "error", error: "Supported: .step, .stp, .FCStd, .SLDPRT, .PRT, .F3D, .IPT." });
+      items.unshift({ id, name: file.name, size: file.size, status: "error", error: MESH.test(file.name) ? "Mesh files (.stl, .obj, .3mf) are not accepted: a STEP export of the exact B-rep geometry is required." : "Supported: .step, .stp, .FCStd, .SLDPRT, .PRT, .F3D, .IPT." });
     } else if (file.size > MAX_BYTES) {
       items.unshift({ id, name: file.name, size: file.size, status: "error", error: `File is ${bytesLabel(file.size)}; the in-browser limit is ${bytesLabel(MAX_BYTES)}.` });
     } else {
@@ -168,8 +181,36 @@ function sample(kind: SampleKind) {
 
 /* ---------- rendering ---------- */
 
+function mountViewers() {
+  for (const slot of resultsEl.querySelectorAll<HTMLElement>(".viewer-slot")) {
+    const id = Number(slot.dataset.id);
+    const preview = items.find((i) => i.id === id)?.report?.preview;
+    if (!preview) continue;
+    let v = viewers.get(id);
+    if (!v) {
+      try {
+        v = new Viewer(preview);
+      } catch {
+        slot.textContent = "3D view needs WebGL, which is unavailable in this browser.";
+        continue;
+      }
+      viewers.set(id, v);
+    }
+    slot.append(v.el);
+    v.attached();
+  }
+}
+
+function dropViewer(id: number) {
+  viewers.get(id)?.dispose();
+  viewers.delete(id);
+}
+
 function render() {
+  // Detach live viewers first so rebuilding the list does not destroy their WebGL canvases.
+  for (const v of viewers.values()) v.el.remove();
   resultsEl.innerHTML = items.map(cardHtml).join("");
+  mountViewers();
   const done = items.filter((i) => i.report);
   const pass = done.filter((i) => i.report!.passed).length;
   const unchecked = done.filter((i) => i.report!.format === "native").length;
@@ -217,6 +258,7 @@ document.querySelectorAll<HTMLButtonElement>("[data-sample]").forEach((b) => b.a
 $("clear").addEventListener("click", () => {
   items.length = 0;
   buffers.clear();
+  for (const id of [...viewers.keys()]) dropViewer(id);
   registry.clear();
   render();
 });
@@ -230,10 +272,14 @@ resultsEl.addEventListener("click", (e) => {
   if (btn.dataset.act === "remove") {
     items.splice(items.indexOf(it), 1);
     buffers.delete(id);
+    dropViewer(id);
     registry.remove(it.name);
     render();
+  } else if (btn.dataset.act === "reset") {
+    viewers.get(id)?.reset();
   } else if (btn.dataset.act === "json" && it.report) {
-    download(`${it.name.replace(/\.[^.]+$/, "")}.validation.json`, JSON.stringify(it.report, null, 2));
+    const text = JSON.stringify(it.report, (k, v) => (k === "preview" ? undefined : v), 2);
+    download(`${it.name.replace(/\.[^.]+$/, "")}.validation.json`, text);
   }
 });
 

@@ -51,7 +51,7 @@ export function parseDocumentXml(xml: string): FcDocument {
       const pname = attr(p[1], "name");
       const ptype = attr(p[1], "type") ?? "";
       if (pname === "Label") label = unescapeXml(attr(p[2], "value") ?? name);
-      else if (pname === "Shape" && ptype.includes("PartShape")) shapeFile = /<Part\s+file="([^"]+)"/.exec(p[2])?.[1] ?? null;
+      else if (pname === "Shape" && ptype.includes("PartShape")) shapeFile = /<Part\b[^>]*\bfile="([^"]+)"/.exec(p[2])?.[1] ?? null;
       else if (pname === "Group") group = [...p[2].matchAll(/<Link\s+value="([^"]+)"/g)].map((x) => x[1]);
       else if (pname && INPUT_PROPS.has(pname)) {
         for (const l of p[2].matchAll(/<Link(?:Sub)?\s+(?:obj=")?value="([^"]+)"/g)) inputs.push(l[1]);

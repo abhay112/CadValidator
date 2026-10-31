@@ -54,6 +54,8 @@ export interface StepInfo {
   description: string | null;
   originatingSystem: string | null;
   headerOk: boolean;
+  /** Length unit declared in the file, e.g. "mm" or "inch"; geometry is measured in mm either way. */
+  units: string | null;
   counts: { solids: number; faces: number; products: number; assemblyLinks: number };
 }
 
@@ -79,6 +81,8 @@ export interface Report {
   sha256: string;
   parsed: boolean;
   passed: boolean;
+  /** Delivery label from the CAD handbook: A native parametric, B native geometry-only, C STEP exchange. */
+  fileClass: "A" | "B" | "C" | null;
   failures: Failure[];
   role: "STANDALONE" | "PARENT";
   measures: Measures | null;
@@ -95,6 +99,8 @@ export interface Report {
   signatures: { label: string; signature: Signature }[];
   notes: string[];
   elapsedMs: number;
+  /** Triangle soup (9 floats per triangle) for the 3D view; never serialised into the JSON report. */
+  preview: Float32Array | null;
 }
 
 export type ToWorker =
@@ -106,6 +112,7 @@ export type FromWorker =
   | { type: "progress"; loaded: number; total: number }
   | { type: "ready" }
   | { type: "initError"; message: string }
+  | { type: "stage"; id: number; text: string }
   | { type: "result"; id: number; report: Report }
   | { type: "sample"; id: number; name: string; buffer: ArrayBuffer }
   | { type: "error"; id: number; message: string };

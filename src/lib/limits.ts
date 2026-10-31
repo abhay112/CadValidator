@@ -23,6 +23,7 @@ export const RULES: RuleDef[] = [
   { code: "non_analytic", title: "Analytic surfaces", requirement: "plane, cylinder, cone, sphere, torus only" },
   { code: "aspect", title: "Proportions", requirement: `longest / shortest bbox side ≤ ${MAX_ASPECT}` },
   { code: "small_feature", title: "Feature size", requirement: `smallest radius ≥ ${MIN_FEATURE_FRACTION * 100}% of longest side` },
+  { code: "cavity", title: "Hidden cavities", requirement: "no internal voids (one shell per solid)" },
   { code: "invalid_brep", title: "B-rep validity", requirement: "BRepCheck_Analyzer reports valid" },
   { code: "free_edges", title: "Closed shell", requirement: "no free edges (gaps / open shell)" },
   { code: "volume", title: "Volume", requirement: "positive volume" },
@@ -44,6 +45,7 @@ export const PER_CHILD_CODES = new Set([
   "non_analytic",
   "aspect",
   "small_feature",
+  "cavity",
   // validate_server.py drops any message containing "solids", which includes this one.
   "reexport_changed_solids",
 ]);

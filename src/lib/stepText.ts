@@ -74,6 +74,13 @@ function headerField(header: string, name: string): string | null {
   return parts.length ? parts.join(", ") : null;
 }
 
+function detectUnits(data: string): string | null {
+  if (/CONVERSION_BASED_UNIT\s*\(\s*'(?:INCH|inch)/i.test(data)) return "inch";
+  const si = /LENGTH_UNIT\s*\(\s*\)[\s\S]{0,120}?SI_UNIT\s*\(\s*(\.\w+\.|\$)\s*,\s*\.METRE\./.exec(data) ?? /SI_UNIT\s*\(\s*(\.\w+\.|\$)\s*,\s*\.METRE\./.exec(data);
+  if (!si) return null;
+  return ({ ".MILLI.": "mm", ".CENTI.": "cm", ".KILO.": "km", $: "m" } as Record<string, string>)[si[1].toUpperCase()] ?? si[1];
+}
+
 const count = (text: string, re: RegExp) => (text.match(re) ?? []).length;
 
 export function parseStepText(text: string): StepStructure {
@@ -98,6 +105,7 @@ export function parseStepText(text: string): StepStructure {
       return parts.length >= 2 ? parts[parts.length - 1] : null;
     })(),
     headerOk,
+    units: detectUnits(data),
     counts,
   };
 

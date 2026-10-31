@@ -27,6 +27,16 @@ const NATIVE: NativeFormat[] = [
 
 const ANALYTIC: Record<number, string> = { 0: "plane", 1: "cylinder", 2: "cone", 3: "sphere", 4: "torus" };
 
+type Sniffed = "step" | "zip" | "ole" | "unknown";
+
+/** What the bytes really are, whatever the extension claims. */
+function sniff(b: Uint8Array): Sniffed {
+  if (/^\s*ISO-10303-21/.test(new TextDecoder().decode(b.subarray(0, 64)))) return "step";
+  if (b[0] === 0x50 && b[1] === 0x4b) return "zip";
+  if ([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1].every((v, i) => b[i] === v)) return "ole";
+  return "unknown";
+}
+
 const round = (x: number, d: number) => Math.round(x * 10 ** d) / 10 ** d;
 
 const treeDepth = (n: TreeNode): number => (n.kind === "assembly" ? 1 + Math.max(0, ...n.children.map(treeDepth)) : 0);
@@ -62,6 +72,8 @@ interface ShapeCheck {
 
 export class Engine {
   private seq = 0;
+  /** Progress hook set by the worker for the file being checked. */
+  onStage: (text: string) => void = () => {};
 
   constructor(private oc: OC) {}
 
@@ -300,6 +312,7 @@ export class Engine {
       parsed: false,
       passed: false,
       failures: [],
+      fileClass: null,
       role: "STANDALONE",
       measures: null,
       reexport: null,
@@ -314,11 +327,25 @@ export class Engine {
       signatures: [],
       notes: [],
       elapsedMs: 0,
+      preview: null,
     };
     const finish = (r: Report): Report => ({ ...r, passed: r.parsed && r.failures.length === 0, elapsedMs: Math.round(performance.now() - t0) });
 
     if (!format) {
       return finish({ ...base, failures: [{ code: "format", message: "Supported files: .step, .stp, .FCStd (checked) and .SLDPRT, .PRT, .F3D, .IPT (identified only)." }] });
+    }
+    const truth = sniff(bytes);
+    const ext = lower.slice(lower.lastIndexOf("."));
+    // "Changing .step to .prt is only renaming" (handbook): trust the bytes, not the extension.
+    if (truth === "step" && format !== "step") {
+      const r = this.validateStep({ ...base, format: "step" }, bytes);
+      return finish({
+        ...r,
+        failures: [{ code: "renamed", message: `This is a STEP exchange file saved with a ${ext} extension. Renaming does not make it native CAD and it carries no design history (class C).` }, ...r.failures],
+      });
+    }
+    if (format === "step" && (truth === "zip" || truth === "ole")) {
+      return finish({ ...base, failures: [{ code: "syntax", message: `This ${truth === "zip" ? "zip archive" : "OLE container"} is a native CAD file renamed to ${ext}. A STEP file is plain text starting with ISO-10303-21; export a real STEP from the CAD tool.` }] });
     }
     if (native) return finish(this.identifyNative(base, bytes, native));
     return finish(format === "step" ? this.validateStep(base, bytes) : this.validateFcstd(base, bytes));
@@ -330,7 +357,7 @@ export class Engine {
     const zip = bytes[0] === 0x50 && bytes[1] === 0x4b;
     const container = ole ? "OLE compound file" : zip ? "zip archive" : "unrecognised container";
     const expected = n.container === "ole" ? ole : n.container === "zip" ? zip : ole || zip;
-    const notes = [`Detected ${container}${expected ? ", as expected for this format" : `; ${n.label} files are normally ${n.container === "zip" ? "a zip archive" : n.container === "ole" ? "an OLE compound file" : "an OLE or zip container"}, so this file may be damaged or mislabelled`}.`];
+    const notes = ["A native extension does not prove the file holds original design history, and that cannot be checked here.", `Detected ${container}${expected ? ", as expected for this format" : `; ${n.label} files are normally ${n.container === "zip" ? "a zip archive" : n.container === "ole" ? "an OLE compound file" : "an OLE or zip container"}, so this file may be damaged or mislabelled`}.`];
     return {
       ...base,
       notes,
@@ -343,6 +370,7 @@ export class Engine {
     const structure = parseStepText(text);
     const r: Report = {
       ...base,
+      fileClass: "C",
       step: structure.info,
       tree: structure.tree,
       role: structure.role,
@@ -397,7 +425,7 @@ export class Engine {
     if (doc.info.sketches + doc.info.pads + doc.info.pockets === 0) {
       notes.push("No Sketch/Pad/Pocket features: geometry-only (class B), not original design history.");
     }
-    const r: Report = { ...base, fcstd, notes, tree: buildFcTree(doc.objects, leaves) };
+    const r: Report = { ...base, fileClass: doc.info.designClass, fcstd, notes, tree: buildFcTree(doc.objects, leaves) };
 
     const shapes: { name: string; shape: Shape }[] = [];
     for (const leaf of leaves) {
@@ -426,6 +454,7 @@ export class Engine {
 
   /** Shared tail: whole-file check, then per-child checks for assemblies. */
   private assemble(r: Report, whole: Shape, children: { name: string; shape: Shape }[] | null): Report {
+    this.onStage("Checking the whole model\u2026");
     const overall = this.check(whole);
     const sig = signatureOf(overall.measures);
     let out: Report = { ...r, measures: overall.measures, reexport: overall.reexport };
@@ -434,12 +463,13 @@ export class Engine {
       const failures = overall.failures;
       out = { ...out, failures, reexportOk: this.reexportOk(failures, overall.reexport) };
       if (sig) out.signatures = [{ label: r.file, signature: sig }];
-      return out;
+      return this.withPreview(out, whole);
     }
 
     // Spec rules apply to every child; the parent file itself must be a valid, closed, re-exportable B-rep.
     const grouped = new Map<string, ChildReport>();
-    for (const c of children) {
+    for (const [i, c] of children.entries()) {
+      this.onStage(`Checking part ${i + 1} of ${children.length}\u2026`);
       const m = this.measure(c.shape);
       const key = [m.faces, round(m.volume, 3), m.bboxDimsSorted.join("x")].join("|");
       const seen = grouped.get(key);
@@ -472,7 +502,47 @@ export class Engine {
       signatures: kids.filter((k) => k.signature).map((k) => ({ label: k.name, signature: k.signature as Signature })),
     };
     if (!out.tree) out.tree = this.flatTree(r.file, kids);
-    return out;
+    return this.withPreview(out, whole);
+  }
+
+  /** Tessellate last: meshing adds triangulation to the shape, which would perturb the measurements above. */
+  private withPreview(out: Report, whole: Shape): Report {
+    this.onStage("Building the 3D view\u2026");
+    try {
+      return { ...out, preview: this.tessellate(whole, out.measures?.longest ?? 0) };
+    } catch {
+      return { ...out, notes: [...out.notes, "The 3D view could not be built for this file."] };
+    }
+  }
+
+  /** Triangle soup read straight from each face's triangulation (the STL writer in this build writes nothing). */
+  private tessellate(shape: Shape, longest: number): Float32Array | null {
+    const oc = this.oc;
+    const defl = Math.max(longest * 0.003, 1e-4);
+    new oc.BRepMesh_IncrementalMesh_2(shape, defl, false, 0.6, false).delete();
+    const out: number[] = [];
+    this.each(shape, "TopAbs_FACE", (cur) => {
+      const face = oc.TopoDS.Face_1(cur);
+      const loc = new oc.TopLoc_Location_1();
+      const handle = oc.BRep_Tool.Triangulation(face, loc);
+      if (handle.IsNull()) return;
+      const tri = handle.get();
+      const trsf = loc.Transformation();
+      const flip = face.Orientation_1() === oc.TopAbs_Orientation.TopAbs_REVERSED;
+      const pts: number[][] = [];
+      for (let i = 1; i <= tri.NbNodes(); i++) {
+        const p = tri.Node(i).Transformed(trsf);
+        pts.push([p.X(), p.Y(), p.Z()]);
+        p.delete();
+      }
+      for (let i = 1; i <= tri.NbTriangles(); i++) {
+        const t = tri.Triangle(i);
+        const order = flip ? [1, 3, 2] : [1, 2, 3];
+        for (const k of order) out.push(...pts[t.Value(k) - 1]);
+      }
+      loc.delete();
+    });
+    return out.length ? Float32Array.from(out) : null;
   }
 
   private reexportOk(fails: Failure[], reexport: Measures | null) {
